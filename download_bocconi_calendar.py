@@ -259,23 +259,17 @@ def _format_duration(minutes: int) -> str:
     return " ".join(parts) or "0 min"
 
 
-def _classe_order(classe: str) -> tuple[int, str]:
-    match = re.search(r"\d+", classe)
-    return (int(match.group()) if match else 0, classe)
-
-
 def event_batch_classes(event: dict[str, str]) -> list[str]:
-    """Resolve actual batches, preferring explicit batch names over planner codes."""
-    text = f"{event['summary']} {event['description']}"
-    explicit_batches = []
-    if re.search(r"\bbatch(?:es)?\b", text, re.IGNORECASE):
-        explicit_batches = [
-            batch for batch in BATCH_CLASS_CODES
-            if re.search(rf"\b{batch}\b", text, re.IGNORECASE)
-        ]
+    """Resolve actual batch names, preferring names written in the description."""
+    description = event["description"]
+    explicit_batches = [
+        batch for batch in BATCH_CLASS_CODES
+        if re.search(rf"\b{batch}\b", description, re.IGNORECASE)
+    ]
     if explicit_batches:
-        return [f"Classe {BATCH_CLASS_CODES[batch]}" for batch in explicit_batches]
+        return explicit_batches
 
+    text = f"{event['summary']} {description}"
     random_code_activity = re.search(
         r"\b(?:teaching activity|extracurricular activity|GL|PPT|"
         r"certification|guest lecture)\b",
@@ -290,9 +284,8 @@ def event_batch_classes(event: dict[str, str]) -> list[str]:
     if not classe_match:
         return []
     code = classe_match.group(1).zfill(2)
-    if code not in BATCH_CLASS_CODES.values():
-        return []
-    return [f"Classe {code}"]
+    return [batch for batch, batch_code in BATCH_CLASS_CODES.items()
+            if code == batch_code]
 
 
 def event_batch_label(event: dict[str, str]) -> str:
@@ -300,12 +293,14 @@ def event_batch_label(event: dict[str, str]) -> str:
     classes = event_batch_classes(event)
     if not classes:
         return f"Batch not specified (planner class: {event['classe']})"
-    batch_names = [
-        name for name, code in BATCH_CLASS_CODES.items()
-        if f"Classe {code}" in classes
-    ]
-    label = ", ".join(f"{name} batch" for name in batch_names)
-    if event["classe"] not in classes:
+    label = ", ".join(f"{name} batch" for name in classes)
+    planner_code = re.fullmatch(r"Classe\s+(\d+)", event["classe"], re.IGNORECASE)
+    mapped_batch = next(
+        (name for name, code in BATCH_CLASS_CODES.items()
+         if planner_code and code == planner_code.group(1).zfill(2)),
+        None,
+    )
+    if mapped_batch not in classes:
         label += f" (planner class: {event['classe']})"
     return label
 
@@ -315,29 +310,29 @@ def batch_availability(
 ) -> dict[str, list[dict[str, object]]]:
     """Return available and blocked intervals per batch within the daily window."""
     class_events: dict[str, list[dict[str, object]]] = {}
-    for classe in classes or set():
-        if classe in {f"Classe {code}" for code in BATCH_CLASS_CODES.values()}:
-            class_events[classe] = []
+    for batch in classes or set():
+        if batch in BATCH_CLASS_CODES:
+            class_events[batch] = []
     for event in events:
         start_match = re.fullmatch(r"(\d{2}):(\d{2})", event["start_time"])
         end_match = re.fullmatch(r"(\d{2}):(\d{2})", event["end_time"])
-        event_classes = event_batch_classes(event)
-        if not event_classes or not start_match or not end_match:
+        event_batches = event_batch_classes(event)
+        if not event_batches or not start_match or not end_match:
             continue
         start = int(start_match.group(1)) * 60 + int(start_match.group(2))
         end = int(end_match.group(1)) * 60 + int(end_match.group(2))
         if end <= start:
             end += 24 * 60
-        for classe in event_classes:
-            class_events.setdefault(classe, []).append({
+        for batch in event_batches:
+            class_events.setdefault(batch, []).append({
                 "start": start,
                 "end": end,
                 "summary": event["summary"],
             })
 
     availability: dict[str, list[dict[str, object]]] = {}
-    for classe in sorted(class_events, key=_classe_order):
-        sessions = sorted(class_events[classe], key=lambda item: (item["start"], item["end"]))
+    for batch in sorted(class_events, key=lambda item: list(BATCH_CLASS_CODES).index(item)):
+        sessions = sorted(class_events[batch], key=lambda item: (item["start"], item["end"]))
         blocks: list[tuple[int, int, list[str]]] = []
         for session in sessions:
             start = max(AVAILABILITY_START, int(session["start"]))
@@ -374,12 +369,12 @@ def batch_availability(
                 "kind": "available", "start": AVAILABILITY_START,
                 "end": AVAILABILITY_END,
             })
-        availability[classe] = intervals
+        availability[batch] = intervals
     return availability
 
 
 def format_report(events: list[dict[str, str]], day: date) -> str:
-    """Format event details and between-session availability by Classe."""
+    """Format event details and between-session availability by batch name."""
     lines = [
         "IMB9 Calendar",
         f"Date: {day:%A, %d %B %Y}",
@@ -407,11 +402,11 @@ def format_report(events: list[dict[str, str]], day: date) -> str:
         "Batch availability from 9:00 AM to 8:00 PM",
         "=" * 64,
     ])
-    availability_by_class = batch_availability(events)
-    if not availability_by_class:
+    availability_by_batch = batch_availability(events)
+    if not availability_by_batch:
         lines.append("No timed events with a Classe value were available to compare.")
-    for classe, intervals in availability_by_class.items():
-        lines.append(classe)
+    for batch, intervals in availability_by_batch.items():
+        lines.append(f"{batch} batch")
         for interval in intervals:
             start = int(interval["start"])
             end = int(interval["end"])
@@ -448,11 +443,11 @@ def write_availability_pdf(
     period_title: str,
 ) -> None:
     """Create a visual PDF containing only daily batch availability and blocked periods."""
-    all_classes = {
-        classe
+    all_batches = {
+        batch
         for day_events in events_by_day.values()
         for event in day_events
-        for classe in event_batch_classes(event)
+        for batch in event_batch_classes(event)
     }
     page_width, _ = landscape(A4)
     doc = SimpleDocTemplate(
@@ -506,7 +501,7 @@ def write_availability_pdf(
         if day_index:
             story.append(PageBreak())
         day_events = events_by_day[day]
-        availability = batch_availability(day_events, all_classes)
+        availability = batch_availability(day_events, all_batches)
         story.extend([
             Paragraph("IMB9 · Batch availability", title_style),
             Paragraph(f"{day:%A, %d %B %Y}", day_style),
@@ -528,7 +523,7 @@ def write_availability_pdf(
             Paragraph("AVAILABLE", header_style),
             Paragraph("BLOCKED · SCHEDULED SESSIONS", header_style),
         ]]
-        for classe, intervals in availability.items():
+        for batch, intervals in availability.items():
             available_lines = []
             blocked_lines = []
             for interval in intervals:
@@ -545,7 +540,7 @@ def write_availability_pdf(
                         f" — {escape(summaries)}"
                     )
             table_data.append([
-                Paragraph(f"<b>{escape(classe)}</b>", cell_style),
+                Paragraph(f"<b>{escape(batch)}</b>", cell_style),
                 Paragraph("<br/>".join(available_lines) or "—", cell_style),
                 Paragraph("<br/>".join(blocked_lines) or "No scheduled sessions", cell_style),
             ])
